@@ -4,6 +4,8 @@ Describe a game in one sentence and play it in your browser a second later.
 
 **Play:** https://siddhanth-mani.github.io/playforge/
 
+![A PlayForge racing game: cars racing at night through a city](docs/screenshot.jpg)
+
 > “make a racing game in Fiji with 3 laps and collect 10 coconuts”
 > “a night race through Suva in a red rally car, hard”
 > “platformer in the rainforest, collect 30 shells under 2 minutes”
