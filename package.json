@@ -1,0 +1,11 @@
+{
+  "name": "playforge",
+  "version": "1.0.0",
+  "description": "Describe a game in a sentence and play it in the browser.",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "test": "node --test \"test/*.test.js\""
+  },
+  "license": "MIT"
+}
