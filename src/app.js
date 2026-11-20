@@ -8,6 +8,7 @@ import { FEATURED } from './gallery.js';
 import { evaluate, headline } from './missions.js';
 import * as audio from './audio.js';
 import * as racing from './engine/racing.js';
+import { createView } from './engine/racing3d.js';
 import * as platformer from './engine/platformer.js';
 import * as shooter from './engine/shooter.js';
 import { formatTime } from './engine/core.js';
@@ -393,12 +394,20 @@ function showPlay(spec, code) {
       h('div', { class: 'pad-group' }, holdButton('Jump', 'action', 'pad-wide')));
   }
 
-  const wrap = h('div', { class: 'play' }, canvas, hud, strip, touch);
+  // Racing draws in 3D when WebGL2 is available: the WebGL canvas sits underneath and the 2D
+  // canvas above it carries the minimap, speedometer and countdown. Otherwise it stays 2D.
+  let canvas3d = null, view = null;
+  if (spec.genre === 'racing') {
+    canvas3d = h('canvas', { class: 'stage', 'aria-hidden': 'true' });
+    view = createView(canvas3d);
+    if (!view) canvas3d = null;
+  }
+  const wrap = h('div', { class: 'play' }, canvas3d, canvas, hud, strip, touch);
   $app.replaceChildren(wrap);
   const ctx = canvas.getContext('2d');
 
   game = {
-    spec, code, engine, canvas, ctx, state: null, running: false, raf: 0, last: 0, acc: 0, hudT: 0,
+    spec, code, engine, canvas, ctx, canvas3d, view, state: null, running: false, raf: 0, last: 0, acc: 0, hudT: 0,
     input: { left: false, right: false, up: false, down: false, action: false, pointer: null },
     pills, strip, wrap, touch, hud,
   };
@@ -418,6 +427,11 @@ function showPlay(spec, code) {
     const r = canvas.getBoundingClientRect();
     canvas.width = Math.max(1, Math.round(r.width * dpr));
     canvas.height = Math.max(1, Math.round(r.height * dpr));
+    if (canvas3d) {
+      const d3 = Math.min(dpr, 1.5); // the 3D scene costs per pixel; the HUD stays sharp
+      canvas3d.width = Math.max(1, Math.round(r.width * d3));
+      canvas3d.height = Math.max(1, Math.round(r.height * d3));
+    }
     game.dpr = dpr;
     game.w = r.width;
     game.h = r.height;
@@ -461,7 +475,15 @@ function render() {
   g.ctx.setTransform(g.dpr, 0, 0, g.dpr, 0, 0);
   const hudBottom = g.hud.getBoundingClientRect().bottom - g.canvas.getBoundingClientRect().top;
   const touchH = g.touch && isTouch() ? g.touch.getBoundingClientRect().height + 16 : 0;
-  g.engine.draw(g.ctx, g.state, g.w, g.h, { top: hudBottom + 36, bottom: touchH, still: !g.running && !g.started });
+  const ui = { top: hudBottom + 36, bottom: touchH, still: !g.running && !g.started };
+  if (g.view && !g.view.lost) {
+    g.view.render(g.state, g.canvas3d.width, g.canvas3d.height);
+    g.ctx.clearRect(0, 0, g.w, g.h);
+    g.engine.drawOverlay(g.ctx, g.state, g.w, g.h, ui);
+  } else {
+    if (g.canvas3d) { g.canvas3d.remove(); g.canvas3d = null; g.view = null; }
+    g.engine.draw(g.ctx, g.state, g.w, g.h, ui);
+  }
 }
 
 function updateHud(force) {
@@ -564,6 +586,7 @@ function stopGame() {
   game.running = false;
   cancelAnimationFrame(game.raf);
   window.removeEventListener('resize', game.resize);
+  game.view?.dispose();
   game = null;
 }
 

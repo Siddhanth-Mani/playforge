@@ -73,6 +73,45 @@ test('easy rivals are slower than hard ones', () => {
   assert.ok(avg(easy) < avg(hard) - 0.1);
 });
 
+test('car physics: real-world acceleration, braking, top speed and grip', () => {
+  const road = { half: 1e9 }; // one endless straight of tarmac
+  const fresh = (kind) => ({ k: racing.CARS[kind], kind, x: 0, y: 0, ang: 0, speed: 0, vx: 0, vy: 0, ax: 0, yawRate: 0, steerAng: 0,
+    wheelSpin: 0, gear: 1, rpm: 900, slip: 0, off: 0, skill: 1, boostT: 0, bumpT: 0 });
+  const drive = (c, ctl, until, max) => { let t = 0; while (!until(c) && t < max) { racing.drive(road, c, ctl, DT); t += DT; } return t; };
+
+  // 0-100 km/h: a hatchback with ~150 kW and front-wheel drive takes about 6-9 s.
+  const hatch = fresh('hatchback');
+  const t100 = drive(hatch, { up: true, steer: 0 }, (c) => c.vx >= 100 / 3.6, 30);
+  assert.ok(t100 > 5 && t100 < 11, `hatchback 0-100 km/h in ${t100.toFixed(1)} s`);
+  assert.ok(hatch.gear >= 2, 'the gearbox shifted up');
+
+  // Braking from 100 km/h on dry tarmac with ABS: about 35-45 m for a modern car.
+  const x0 = hatch.x;
+  drive(hatch, { down: true, steer: 0 }, (c) => c.vx <= 0.2, 20);
+  const stop = (hatch.x - x0) / racing.PX;
+  assert.ok(stop > 32 && stop < 48, `braking distance ${stop.toFixed(1)} m`);
+
+  // Top speed lands on each car's rated maximum (power against drag and rolling resistance).
+  for (const kind of Object.keys(racing.CARS)) {
+    const c = fresh(kind);
+    drive(c, { up: true, steer: 0 }, () => false, 90);
+    const err = Math.abs(c.speed - c.k.max) / c.k.max;
+    assert.ok(err < 0.04, `${kind} top speed ${(c.vx * 3.6).toFixed(0)} km/h`);
+  }
+
+  // Full lock at 20 m/s: the tyres hold no more than mu*g sideways and stability control
+  // stops the car spinning.
+  for (const kind of Object.keys(racing.CARS)) {
+    const c = fresh(kind);
+    c.vx = 20; c.speed = 200;
+    let maxBeta = 0, maxLat = 0;
+    drive(c, { up: true, steer: 1 }, (cc) => { maxBeta = Math.max(maxBeta, Math.abs(Math.atan2(cc.vy, cc.vx))); maxLat = Math.max(maxLat, Math.abs(cc.vx * cc.yawRate)); return false; }, 6);
+    assert.ok(c.yawRate > 0.2, `${kind} keeps turning`);
+    assert.ok(maxBeta < 0.35, `${kind} body slip ${maxBeta.toFixed(2)} rad`);
+    assert.ok(maxLat < c.k.phys.mu * 9.81 * 1.15, `${kind} lateral ${maxLat.toFixed(1)} m/s2`);
+  }
+});
+
 test('platformer levels only contain gaps and steps the jump can clear', () => {
   for (const layout of Object.keys(LAYOUTS.platformer)) {
     for (const difficulty of ['easy', 'normal', 'hard']) {

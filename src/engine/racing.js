@@ -1,18 +1,46 @@
-// Top-down racing: a closed track built from the spec's layout and seed, laps, AI rivals,
-// coconuts to collect, boost pads and obstacles. Game logic (create/step/result) has no DOM
-// access; draw() and thumb() take a 2D canvas context.
+// Racing: a closed track built from the spec's layout and seed, laps, AI rivals, coconuts to
+// collect, boost pads and obstacles. Game logic (create/step/result) has no DOM access, so whole
+// races run in Node tests; draw() and thumb() take a 2D canvas context, and racing3d.js draws the
+// same state in WebGL.
+//
+// Units: the world is in pixels with 10 px = 1 m, so speeds in px/s are 10x m/s.
+// Cars use a dynamic bicycle model (see drive()): tyre slip angles with a Pacejka-style grip
+// curve, load transfer under braking and acceleration, a friction circle on each axle,
+// engine power and gears, aerodynamic drag and rolling resistance.
 import { rng, THEMES, ordinal } from '../spec.js';
 import { clamp, wrapAngle, shade, rrect, byLevel, formatTime } from './core.js';
 
 export const STEP = 10; // distance between track points, in world pixels
 
+export const PX = 10; // pixels per metre
+export const G = 9.81;
+
+// max/accel/len/wid are in px (the 2D view and the AI use them); `phys` is the real car in kg,
+// metres and watts. Power is set so the car is grip-limited up to vGrip m/s and power-limited
+// after that, and drag is solved so the top speed matches `max`.
 export const CARS = {
-  hatchback: { max: 500, accel: 330, turn: 2.7, len: 34, wid: 18, mass: 1 },
-  rally: { max: 540, accel: 360, turn: 2.8, len: 36, wid: 19, mass: 1 },
-  pickup: { max: 480, accel: 300, turn: 2.45, len: 40, wid: 20, mass: 1.3 },
-  bus: { max: 440, accel: 270, turn: 2.2, len: 58, wid: 22, mass: 1.8 },
-  scooter: { max: 470, accel: 380, turn: 3.2, len: 24, wid: 10, mass: 0.6 },
+  hatchback: { max: 500, accel: 330, turn: 2.7, len: 34, wid: 18, mass: 1,
+    phys: { kg: 1150, wheelbase: 2.45, cgFront: 0.6, cgHeight: 0.52, launch: 8.0, vGrip: 17, drive: 'front', mu: 1.05, steer: 0.62, gears: 5 } },
+  rally: { max: 540, accel: 360, turn: 2.8, len: 36, wid: 19, mass: 1,
+    phys: { kg: 1250, wheelbase: 2.6, cgFront: 0.55, cgHeight: 0.48, launch: 8.8, vGrip: 19, drive: 'all', mu: 1.12, steer: 0.62, gears: 6 } },
+  pickup: { max: 480, accel: 300, turn: 2.45, len: 40, wid: 20, mass: 1.3,
+    phys: { kg: 1850, wheelbase: 3.1, cgFront: 0.55, cgHeight: 0.7, launch: 7.0, vGrip: 16, drive: 'rear', mu: 1.0, steer: 0.58, gears: 5 } },
+  bus: { max: 440, accel: 270, turn: 2.2, len: 58, wid: 22, mass: 1.8,
+    phys: { kg: 4200, wheelbase: 3.9, cgFront: 0.5, cgHeight: 1.0, launch: 4.0, vGrip: 13, drive: 'rear', mu: 0.95, steer: 0.6, gears: 5 } },
+  scooter: { max: 470, accel: 380, turn: 3.2, len: 24, wid: 10, mass: 0.6,
+    phys: { kg: 260, wheelbase: 1.45, cgFront: 0.48, cgHeight: 0.6, launch: 7.5, vGrip: 16, drive: 'rear', mu: 1.1, steer: 0.5, gears: 6 } },
 };
+for (const k of Object.values(CARS)) {
+  const p = k.phys;
+  p.vTop = k.max / PX;                          // m/s
+  p.power = p.kg * p.launch * p.vGrip;          // W
+  p.rolling = 0.013 * p.kg * G;                 // N
+  p.drag = Math.max(0.05, (p.power / p.vTop - p.rolling) / (p.vTop * p.vTop)); // N per (m/s)^2
+  p.inertia = p.kg * (p.wheelbase * 0.62) ** 2; // yaw inertia, kg m^2
+  p.a = p.wheelbase * (1 - p.cgFront);           // centre of mass to front axle
+  p.b = p.wheelbase * p.cgFront;                 // centre of mass to rear axle
+  p.wheelR = k.len > 50 ? 0.45 : k.len > 38 ? 0.38 : k.len < 26 ? 0.3 : 0.32;
+}
 const RIVAL_NAMES = ['Mere', 'Tevita', 'Ana', 'Josaia', 'Salote', 'Ravi', 'Litia', 'Sami'];
 const RIVAL_COLORS = ['#1e88e5', '#fdd835', '#43a047', '#8e24aa', '#fb8c00', '#00897b'];
 
@@ -149,7 +177,21 @@ export function buildTrack(spec) {
     bend[i] = m;
   }
   const width = byLevel(spec, [136, 124, 112]);
-  return { pts: out, N, bend, turn, width, half: width / 2, w: maxX - minX + 2 * M, h: maxY - minY + 2 * M };
+  // Fastest safe speed at each point (m/s): radius from the heading change over 8 points,
+  // v = sqrt(mu g R) with a margin, then a backward pass so the AI starts braking in time.
+  const vlim = new Float32Array(N);
+  for (let i = 0; i < N; i++) {
+    const R = (8 * STEP / PX) / Math.max(turn[i], 1e-3);
+    vlim[i] = Math.min(90, Math.sqrt(0.78 * G * R));
+  }
+  const brake = 6.5, ds = STEP / PX;
+  for (let pass = 0; pass < 2; pass++) {
+    for (let i = N - 1; i >= 0; i--) {
+      const next = vlim[(i + 1) % N];
+      vlim[i] = Math.min(vlim[i], Math.sqrt(next * next + 2 * brake * ds));
+    }
+  }
+  return { pts: out, N, bend, turn, vlim, width, half: width / 2, w: maxX - minX + 2 * M, h: maxY - minY + 2 * M };
 }
 
 const lateral = (p, d) => ({ x: p.x - Math.sin(p.a) * d, y: p.y + Math.cos(p.a) * d });
@@ -187,6 +229,7 @@ export function create(spec) {
       color: isPlayer ? spec.player.color : RIVAL_COLORS[(slot + spec.map.seed) % RIVAL_COLORS.length],
       name: isPlayer ? 'You' : RIVAL_NAMES[(slot + spec.map.seed) % RIVAL_NAMES.length],
       x: pos.x, y: pos.y, ang: pts[idx].a, speed: 0,
+      vx: 0, vy: 0, ax: 0, yawRate: 0, steerAng: 0, wheelSpin: 0, gear: 1, rpm: 900, slip: 0, braking: false, throttle: 0,
       idx, lap: -1, prog: idx - N, off: 0, lat: 0,
       finished: false, finishTime: 0, boostT: 0, bumpT: 0,
       skill: isPlayer ? 1 : clamp(base + (r() - 0.5) * 0.06, 0.7, 1.02),
@@ -254,7 +297,7 @@ export function create(spec) {
 
 export function aiControl(s, car) {
   const { pts, N, bend } = s.track;
-  const look = 10 + Math.floor(Math.abs(car.speed) / 45);
+  const look = 8 + Math.floor(Math.abs(car.speed) / 28); // about 0.3 s ahead plus 8 m
   const p = pts[(car.idx + look) % N];
   let lane = car.lane;
   for (const o of s.obstacles) {
@@ -274,24 +317,141 @@ export function aiControl(s, car) {
     if (gap > 150) mod = 1.06;
     else if (gap < -150) mod = 0.95;
   }
-  const target = car.k.max * car.skill * mod * (1 - clamp(bend[car.idx] * 0.85, 0, 0.6));
-  return { steer: clamp(diff * 2.6, -1, 1), up: car.speed < target, down: car.speed > target + 70, mod };
+  // Corner limit a little ahead, scaled by skill so weaker rivals brake earlier.
+  const vl = s.track.vlim;
+  let corner = Infinity;
+  for (let d = 0; d < 6; d++) corner = Math.min(corner, vl[(car.idx + d) % N]);
+  const grip = Math.sqrt(car.k.phys.mu / 1.05) * (car.k.phys.cgHeight > 0.8 ? 0.94 : 1); // tall bus: lower
+  const target = Math.min(car.k.max * car.skill * mod, corner * PX * grip * (0.9 + 0.1 * car.skill));
+  // Pure pursuit: the steering angle whose arc passes through the target point, as a fraction of
+  // the lock available at this speed, with a little yaw-rate damping against weaving.
+  const ph = car.k.phys;
+  const ld = Math.max(4, Math.hypot(t.x - car.x, t.y - car.y) / PX);
+  const want = Math.atan((2 * ph.wheelbase * Math.sin(diff)) / ld);
+  const lock = ph.steer / (1 + Math.hypot(car.vx, car.vy) / 14);
+  const yawWant = (2 * Math.max(car.vx, 1) * Math.sin(diff)) / ld;
+  const steer = clamp(want / lock + 0.25 * (yawWant - car.yawRate), -1, 1);
+  return { steer, up: car.speed < target, down: car.speed > target + 25, mod };
 }
 
-function drive(s, car, ctl, dt) {
-  const k = car.k;
+// Pacejka "magic formula" with typical road-tyre coefficients: grip rises with slip angle, peaks
+// near 6 degrees and falls off a little beyond it, which is what lets a car slide.
+const tyre = (slip, load, mu) => mu * load * Math.sin(1.9 * Math.atan(10 * slip));
+const RATIOS = [3.4, 2.2, 1.6, 1.25, 1.0, 0.84];
+
+// One car, one fixed step. Body frame: vx forward, vy to the right (the same side lateral()
+// uses), yawRate positive turns toward the right. Forces in newtons, distances in metres.
+export function drive(s, car, ctl, dt) {
+  const k = car.k, p = k.phys;
+  // Collisions and the track edge scale car.speed directly; carry that into the model.
+  const ext = car.speed / PX;
+  if (Math.abs(ext - car.vx) > 1e-6) {
+    const f = car.vx !== 0 ? clamp(ext / car.vx, 0, 1) : 0;
+    car.vx = ext;
+    car.vy *= f;
+    car.yawRate *= f;
+  }
   const boosting = car.boostT > 0;
-  let max = k.max * car.skill * (ctl.mod || 1) * (boosting ? 1.3 : 1);
-  if (car.off > s.half) max *= 0.5;
-  if (ctl.up) car.speed += k.accel * (boosting ? 1.8 : 1) * dt;
-  else if (ctl.down) car.speed -= (car.speed > 0 ? 720 : 260) * dt;
-  else car.speed -= Math.sign(car.speed) * Math.min(Math.abs(car.speed), 160 * dt);
-  if (car.speed > max) car.speed = Math.max(max, car.speed - 700 * dt);
-  if (car.speed < -160) car.speed = -160;
-  const grip = clamp(Math.abs(car.speed) / 160, 0, 1) * (1 - 0.3 * clamp(car.speed / k.max, 0, 1));
-  car.ang = wrapAngle(car.ang + clamp(ctl.steer, -1, 1) * k.turn * grip * dt * (car.speed < 0 ? -1 : 1));
-  car.x += Math.cos(car.ang) * car.speed * dt;
-  car.y += Math.sin(car.ang) * car.speed * dt;
+  const offroad = car.off > s.half;
+  const mu = p.mu * (offroad ? 0.62 : 1);
+  // Governor: rival skill and catch-up, boost pads, grass.
+  const vCap = p.vTop * car.skill * (ctl.mod || 1) * (boosting ? 1.3 : 1) * (offroad ? 0.55 : 1);
+  const steerIn = clamp(ctl.steer || 0, -1, 1);
+
+  const sub = 2, h = dt / sub;
+  let braking = false;
+  for (let it = 0; it < sub; it++) {
+    const v = car.vx;
+    const speed = Math.hypot(car.vx, car.vy);
+    // Full lock at parking speed, less at speed, as a driver would.
+    const lock = p.steer / (1 + speed / 14);
+    car.steerAng += clamp(steerIn * lock - car.steerAng, -4.5 * h, 4.5 * h);
+    const delta = car.steerAng;
+
+    // Longitudinal force request.
+    let Fx = 0;
+    braking = false;
+    if (ctl.up) {
+      if (v < -0.5) { Fx = mu * p.kg * G * 0.9; braking = true; }
+      else if (v < vCap) Fx = Math.min(p.kg * p.launch * (boosting ? 1.6 : 1), (p.power * (boosting ? 1.8 : 1)) / Math.max(Math.abs(v), 1));
+    } else if (ctl.down) {
+      if (v > 0.5) { Fx = -mu * p.kg * G * 0.95; braking = true; } // ABS: brakes never lock
+      else if (v > -8) Fx = -p.kg * 3.5;                            // reverse
+    }
+    if (v > vCap * 1.02 && !braking) Fx = Math.min(Fx, -p.kg * 2.5); // over the governor: engine braking
+    const resist = p.drag * v * Math.abs(v) + Math.sign(v) * p.rolling * (offroad ? 4 : 1);
+
+    // Axle loads with longitudinal load transfer from the measured acceleration (the body pitches
+    // after the force builds, so the last step's value is used).
+    const transfer = (p.kg * clamp(car.ax || 0, -1.2 * G, 1.2 * G) * p.cgHeight) / p.wheelbase;
+    const Wf = Math.max(0.15 * p.kg * G, p.kg * G * p.cgFront - transfer);
+    const Wr = Math.max(0.15 * p.kg * G, p.kg * G * (1 - p.cgFront) + transfer);
+
+    if (Math.abs(v) > 2.5) {
+      const vxAbs = Math.abs(v), dir = Math.sign(v);
+      const sf = Math.atan2(car.vy + p.a * car.yawRate, vxAbs) - delta * dir;
+      const sr = Math.atan2(car.vy - p.b * car.yawRate, vxAbs);
+      // Friction circle per axle. Cornering force comes first (traction control and ABS trim
+      // the drive and brake force to what is left), but at least 35% stays for drive or brakes.
+      // Brakes are split by axle load (EBD); drive goes to the driven axle(s).
+      const shareF = braking ? Wf / (Wf + Wr) : p.drive === 'front' ? 1 : p.drive === 'all' ? 0.5 : 0;
+      const axle = (slip, W, fx) => {
+        const lim = mu * W;
+        let fy = clamp(-tyre(slip, W, mu), -lim, lim);
+        const room = Math.max(0.35 * lim, Math.sqrt(Math.max(0, lim * lim - fy * fy)));
+        fx = clamp(fx, -room, room);
+        const side = Math.sqrt(Math.max(0, lim * lim - fx * fx));
+        return [fx, clamp(fy, -side, side)];
+      };
+      const [fxF, Fyf] = axle(sf, Wf, Fx * shareF);
+      const [fxR, Fyr] = axle(sr, Wr, Fx * (1 - shareF));
+      Fx = fxF + fxR;
+      car.slip = Math.max(Math.abs(sr), Math.abs(sf) * 0.7);
+      const cosd = Math.cos(delta), sind = Math.sin(delta);
+      let ax = (Fx - resist - Fyf * sind) / p.kg + car.vy * car.yawRate;
+      const ay = (Fyr + Fyf * cosd) / p.kg - v * car.yawRate;
+      let yawAcc = (p.a * Fyf * cosd - p.b * Fyr) / p.inertia;
+      // Stability control (ESC): when the car yaws faster or slower than the steering asks for
+      // (limited to what the tyres can hold), single-wheel braking adds a correcting moment.
+      const rRef = clamp((v * Math.tan(delta)) / p.wheelbase, -(mu * G) / vxAbs, (mu * G) / vxAbs);
+      const err = car.yawRate - rRef;
+      if (Math.abs(err) > 0.08) {
+        yawAcc -= Math.sign(err) * Math.min(Math.abs(err) - 0.08, 1) * 9;
+        ax -= 0.8 * Math.min(Math.abs(err), 1);
+      }
+      car.ax = ax - car.vy * car.yawRate;
+      car.vx += ax * h;
+      car.vy += ay * h;
+      car.yawRate += yawAcc * h;
+    } else {
+      // Parking speeds: slip angles are singular near zero, so roll like a kinematic bicycle.
+      car.ax = (Fx - resist) / p.kg;
+      car.vx += car.ax * h;
+      if (!ctl.up && !ctl.down && Math.abs(car.vx) < 0.3) car.vx = 0;
+      car.vy *= Math.exp(-12 * h);
+      car.yawRate = (car.vx * Math.tan(delta)) / p.wheelbase;
+      car.slip = 0;
+    }
+    car.ang = wrapAngle(car.ang + car.yawRate * h);
+    const c = Math.cos(car.ang), sn = Math.sin(car.ang);
+    car.x += (c * car.vx - sn * car.vy) * PX * h;
+    car.y += (sn * car.vx + c * car.vy) * PX * h;
+  }
+  car.braking = braking;
+  car.throttle = ctl.up ? 1 : 0;
+  car.speed = car.vx * PX;
+  car.wheelSpin = (car.wheelSpin + (car.vx / p.wheelR) * dt) % (Math.PI * 2);
+  // Gearbox for the HUD: shift up at 6,400 rpm, down when the lower gear sits under 5,200.
+  const n = p.gears;
+  const toRpm = 60 / (2 * Math.PI);
+  const final = 6600 / ((p.vTop / p.wheelR) * toRpm * RATIOS[n - 1]); // top gear peaks at top speed
+  const wheelRpm = (Math.abs(car.vx) / p.wheelR) * (60 / (2 * Math.PI));
+  const rpmAt = (g) => wheelRpm * RATIOS[g - 1] * final;
+  let g = clamp(car.gear || 1, 1, n);
+  if (rpmAt(g) > 6400 && g < n) g++;
+  else if (g > 1 && rpmAt(g - 1) < 5200) g--;
+  car.gear = car.vx < -0.5 ? 0 : g;
+  car.rpm = clamp(rpmAt(g), 900, 7200);
   if (car.boostT > 0) car.boostT -= dt;
   if (car.bumpT > 0) car.bumpT -= dt;
 }
@@ -461,7 +621,7 @@ export function hud(s) {
 
 /* ------------------------------------------------------------------ drawing */
 
-function kerbColors(theme) {
+export function kerbColors(theme) {
   return {
     'suva-city': ['#9e9e9e', '#eeeeee'], 'night-city': ['#40c4ff', '#14171d'], reef: ['#ffffff', '#80deea'],
     space: ['#b388ff', '#2a2e52'], volcano: ['#ff6d00', '#2b2626'],
@@ -777,8 +937,14 @@ export function draw(ctx, s, W, H, ui = {}) {
   }
   drawCar(ctx, me, me.color, me.kind);
   ctx.restore();
+  drawOverlay(ctx, s, W, H, ui);
+}
 
-  // minimap
+// Minimap, speedometer and countdown. The 2D view draws them over its own frame; the 3D view
+// draws them on a transparent canvas above the WebGL one.
+export function drawOverlay(ctx, s, W, H, ui = {}) {
+  const { track } = s, me = s.cars[s.pi];
+  const font = '-apple-system, BlinkMacSystemFont, "SF Pro Display", "Segoe UI", Roboto, sans-serif';
   const top = ui.top ?? 64;
   const mw = Math.min(150, W * 0.3);
   const sc = Math.min(mw / track.w, 110 / track.h);
@@ -799,9 +965,35 @@ export function draw(ctx, s, W, H, ui = {}) {
   }
   ctx.restore();
 
+  // Speedometer: km/h, gear and an rpm bar, above the touch controls when they are showing.
+  if (!ui.still) {
+    const kmh = Math.round(Math.abs(me.vx || 0) * 3.6);
+    const pw = 132, ph = 64, px = 12, py = H - (ui.bottom || 0) - ph - 14;
+    ctx.fillStyle = 'rgba(15,18,24,.55)';
+    rrect(ctx, px, py, pw, ph, 12); ctx.fill();
+    ctx.textBaseline = 'alphabetic';
+    ctx.textAlign = 'left';
+    ctx.fillStyle = '#fff';
+    ctx.font = `700 28px ${font}`;
+    ctx.fillText(String(kmh), px + 12, py + 36);
+    const numW = ctx.measureText(String(kmh)).width;
+    ctx.font = `600 11px ${font}`;
+    ctx.fillStyle = 'rgba(255,255,255,.7)';
+    ctx.fillText('km/h', px + 16 + numW, py + 36);
+    ctx.textAlign = 'right';
+    ctx.font = `700 22px ${font}`;
+    ctx.fillStyle = '#fff';
+    ctx.fillText(me.gear === 0 ? 'R' : String(me.gear || 1), px + pw - 12, py + 34);
+    const frac = clamp(((me.rpm || 900) - 900) / 6300, 0, 1);
+    ctx.fillStyle = 'rgba(255,255,255,.18)';
+    rrect(ctx, px + 12, py + ph - 18, pw - 24, 6, 3); ctx.fill();
+    ctx.fillStyle = frac > 0.86 ? '#ff5252' : me.color;
+    rrect(ctx, px + 12, py + ph - 18, Math.max(6, (pw - 24) * frac), 6, 3); ctx.fill();
+  }
+
   if (!ui.still && (s.phase === 'countdown' || (s.phase === 'race' && s.raceTime < 0.8))) {
     const label = s.phase === 'countdown' ? String(Math.ceil(s.count)) : 'Go!';
-    ctx.font = `700 ${Math.round(Math.min(W, H) * 0.2)}px -apple-system, BlinkMacSystemFont, "SF Pro Display", "Segoe UI", Roboto, sans-serif`;
+    ctx.font = `700 ${Math.round(Math.min(W, H) * 0.2)}px ${font}`;
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
     ctx.fillStyle = 'rgba(0,0,0,.25)';
